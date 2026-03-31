@@ -29,7 +29,7 @@ dev = "cuda"
 # --- physics ---
 L = 16           # lattice size
 vocab_size = 18  # Q
-beta = 0.44
+beta = np.log(1 + np.sqrt(vocab_size))
 
 # --- model hyperparams ---
 n_layer = 1 
@@ -75,8 +75,6 @@ wandb_run = wandb.init(
         name=f"Q={vocab_size}_symmetry",
         config=config_wb,
 )
-
-
 
 # --- log probability ---
 def log_prob(model, sample):
