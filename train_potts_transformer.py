@@ -2,7 +2,7 @@
 # GPT training script for Potts Physics           #
 #                                                 #
 # Jan Kwinta                                      #
-# March 2026                                      #
+# April 2026                                      #
 ###################################################
 
 # ML imports
@@ -38,7 +38,7 @@ n_embd = 128
 dropout = 0.0
 bias = True
 batch_size = 4096 
-D4_symmetry = True
+full_symmetry = True
 
 # --- training hyperparams ---
 iterations = 40000
@@ -85,7 +85,7 @@ def log_prob(model, sample):
     out = log_probs[:, :-1].gather(2, sample[:, 1:].unsqueeze(-1)).squeeze()
     return torch.sum(out, dim=-1) - np.log(config.vocab_size)
 
-# --- Full Symmetry ---
+# --- full symmetry ---
 def apply_symmetry(sample, L, Q):
     B = sample.shape[0]
     s = sample.view(B, L, L)
@@ -120,7 +120,7 @@ try:
             start = torch.randint(0, vocab_size, (batch_size, 1), device=dev)
             sample_raw = model._orig_mod.generate(start, L * L - 1)
             
-            if D4_symmetry:
+            if full_symmetry:
                 sample_sym = apply_symmetry(sample_raw, L, vocab_size)
             else:
                 sample_sym = sample_raw
