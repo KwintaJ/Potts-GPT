@@ -18,8 +18,8 @@ from torch.nn import functional as F
 
 @dataclass
 class GPTConfig:
-    block_size: int = 1024  # number of spins, L*L
-    vocab_size: int = 2     # number of Potts states Q
+    block_size: int = 1024  # sequence length (number of patch tokens)
+    vocab_size: int = 2     # number of patch states
     n_layer: int = 4
     n_head: int = 4
     n_embd: int = 128
@@ -106,10 +106,9 @@ class Block(nn.Module):
 
 
 class GPT(nn.Module):
-    """autoregressive model over spin configurations flattened in raster order
+    """decoder over token sequences; the extra token `bos` starts every sequence
 
-    The first spin is not modelled; it is drawn uniformly from Q states and the
-    network only produces conditionals for spins 1..T-1 (see `log_prob`).
+    Feeding [bos, t_0, ..., t_{T-2}] returns the logits of t_0, ..., t_{T-1}.
     """
 
     def __init__(self, config: GPTConfig):
@@ -117,17 +116,18 @@ class GPT(nn.Module):
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
+        self.bos = config.vocab_size
 
         self.transformer = nn.ModuleDict(
             dict(
-                wte=nn.Embedding(config.vocab_size, config.n_embd),
+                wte=nn.Embedding(config.vocab_size + 1, config.n_embd),
                 wpe=nn.Embedding(config.block_size, config.n_embd),
                 drop=nn.Dropout(config.dropout),
                 h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
                 ln_f=LayerNorm(config.n_embd, bias=config.bias),
             )
         )
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size + 1, bias=False)
         self.transformer.wte.weight = self.lm_head.weight
 
         self.apply(self._init_weights)
@@ -150,7 +150,7 @@ class GPT(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, caches=None, pos=None):
-        """logits of the next spin for every position of `idx`
+        """next-token logits (B, T, vocab) for every position of `idx`
 
         Without caches this is the usual causal forward over the whole sequence.
         With caches `idx` holds a single token which sits at position `pos`.
@@ -174,14 +174,8 @@ class GPT(nn.Module):
         for block, cache in zip(self.transformer.h, caches):
             x = block(x, cache, pos)
         x = self.transformer.ln_f(x)
-        return self.lm_head(x)
-
-    def log_prob(self, sample):
-        """log q(sample) for a batch of full configurations of shape (B, T)"""
-        logits = self(sample[:, :-1])
-        log_probs = F.log_softmax(logits.float(), dim=-1)
-        out = log_probs.gather(2, sample[:, 1:].unsqueeze(-1)).squeeze(-1)
-        return torch.sum(out, dim=-1) - math.log(self.config.vocab_size)
+        # the tied embedding also holds the bos row, which is never a prediction target
+        return self.lm_head(x)[:, :, : self.config.vocab_size]
 
     def new_caches(self, batch_size, length, device, dtype=torch.float32):
         hs = self.config.n_embd // self.config.n_head
@@ -191,26 +185,3 @@ class GPT(nn.Module):
              torch.zeros(shape, device=device, dtype=dtype))
             for _ in self.transformer.h
         ]
-
-    @torch.no_grad()
-    def generate(self, idx, max_new_tokens):
-        """extend the prefix `idx` (B, t0) by `max_new_tokens` spins sampled from the model"""
-        B, t0 = idx.size()
-        T = t0 + max_new_tokens
-        assert T <= self.config.block_size
-        dtype = self.transformer.wte.weight.dtype
-        caches = self.new_caches(B, T, idx.device, dtype)
-
-        # push the prefix through the cache, the last prefix token starts the sampling loop
-        for pos in range(t0 - 1):
-            self(idx[:, pos : pos + 1], caches, pos)
-
-        tokens = [idx]
-        current = idx[:, -1:]
-        for pos in range(t0 - 1, T - 1):
-            logits = self(current, caches, pos)[:, -1, :]
-            probs = F.softmax(logits.float(), dim=-1)
-            current = torch.multinomial(probs, num_samples=1)
-            tokens.append(current)
-
-        return torch.cat(tokens, dim=1)

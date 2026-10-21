@@ -7,15 +7,13 @@
 
 import argparse
 import math
-from dataclasses import asdict
 from functools import partial
 
-import numpy as np
 import torch
 from tqdm import tqdm
 
 from potts import beta_critical, energy2D, exact_free_energy
-from transformer import GPT, GPTConfig
+from sampler import PottsSampler
 
 
 def parse_args():
@@ -26,6 +24,12 @@ def parse_args():
     phys.add_argument("--beta", type=float, default=None, help="default: critical ln(1+sqrt(Q))")
 
     model = p.add_argument_group("model")
+    model.add_argument("--patch", type=int, nargs=2, default=(1, 1), metavar=("R", "C"),
+                       help="spins per token, R x C patches")
+    model.add_argument("--ap", action="store_true",
+                       help="approximate probabilities: add beta * bond counts to the logits")
+    model.add_argument("--canonical", action="store_true",
+                       help="model only the Z_Q canonical relabelling of configurations")
     model.add_argument("--n-layer", type=int, default=4)
     model.add_argument("--n-head", type=int, default=4)
     model.add_argument("--n-embd", type=int, default=128)
@@ -105,20 +109,23 @@ def main():
         torch.manual_seed(args.seed)
     torch.set_float32_matmul_precision("high")
 
-    config = GPTConfig(
-        vocab_size=Q,
-        block_size=L * L,
+    model = PottsSampler(
+        L, Q,
+        patch=tuple(args.patch),
+        approximate=args.ap,
+        canonical=args.canonical,
         n_layer=args.n_layer,
         n_head=args.n_head,
         n_embd=args.n_embd,
         dropout=args.dropout,
         bias=not args.no_bias,
-    )
-    raw_model = GPT(config).to(dev)
-    model = torch.compile(raw_model) if use_compile else raw_model
+    ).to(dev)
+    if use_compile:
+        model.train_gpt = torch.compile(model.gpt)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(args.beta1, args.beta2))
     batched_bincount = torch.vmap(partial(torch.bincount, minlength=Q))
-    print(f"device={dev} params={raw_model.get_num_params() / 1e6:.2f}M beta={beta:.5f}")
+    print(f"device={dev} params={model.gpt.get_num_params() / 1e6:.2f}M beta={beta:.5f} "
+          f"tokens={model.codec.n_patches} vocab={model.codec.vocab}")
 
     f_exact = exact_free_energy(L, Q, beta) if args.exact else None
     if f_exact is not None:
@@ -131,7 +138,8 @@ def main():
         entity=args.wandb_entity,
         project=args.wandb_project or f"potts-train-{L}",
         name=args.name or f"Q={Q}",
-        config=dict(vars(args), beta=beta, device=dev, **asdict(config)),
+        config=dict(vars(args), beta=beta, device=dev, vocab=model.codec.vocab,
+                    n_params=model.gpt.get_num_params()),
     )
 
     try:
@@ -141,8 +149,7 @@ def main():
             # --- sampling ---
             model.eval()
             with torch.no_grad():
-                start = torch.randint(0, Q, (args.batch_size, 1), device=dev)
-                sample_raw = raw_model.generate(start, L * L - 1)
+                sample_raw = model.generate(args.batch_size, beta_train)
                 sample_sym = sample_raw if args.no_symmetry else apply_symmetry(sample_raw, L, Q)
 
             # --- training ---
@@ -150,11 +157,11 @@ def main():
             optimizer.zero_grad(set_to_none=True)
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_autocast):
-                log_p_raw = model.log_prob(sample_raw)
+                log_p_raw = model.log_prob(sample_raw, beta_train)
                 if args.no_symmetry:
                     log_p = log_p_raw
                 else:
-                    log_p_sym = model.log_prob(sample_sym)
+                    log_p_sym = model.log_prob(sample_sym, beta_train)
                     log_p = torch.logaddexp(log_p_raw, log_p_sym) - math.log(2.0)
 
             energy = energy2D(sample_raw, L, L)
@@ -191,9 +198,8 @@ def main():
         with torch.inference_mode():
             loss_arr = []
             for _ in range(args.eval_batches):
-                start = torch.randint(0, Q, (args.batch_size, 1), device=dev)
-                sample = raw_model.generate(start, L * L - 1)
-                loss = raw_model.log_prob(sample) + energy2D(sample, L, L) * beta
+                sample = model.generate(args.batch_size, beta)
+                loss = model.log_prob(sample, beta) + energy2D(sample, L, L) * beta
                 loss_arr.append(loss.cpu())
 
             loss_t = torch.cat(loss_arr).double()
@@ -210,8 +216,7 @@ def main():
                                     final_ess=effective_sample_size(loss_t)))
 
         if args.out:
-            torch.save(dict(config=asdict(config), state_dict=raw_model.state_dict(),
-                            args=vars(args), beta=beta), args.out)
+            torch.save(dict(state_dict=model.state_dict(), args=vars(args), beta=beta), args.out)
 
         run.finish()
 
