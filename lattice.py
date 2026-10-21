@@ -156,8 +156,9 @@ def canonicalize(ordered, Q):
 
 def log_relabelings(n_distinct, Q):
     """log of the number of configurations in the Z_Q orbit of a canonical one, Q!/(Q-m)!"""
-    m = n_distinct.double()
-    return (torch.lgamma(torch.tensor(Q + 1.0, dtype=torch.float64)) - torch.lgamma(Q - m + 1)).float()
+    # float32 is enough here and mps has no float64
+    m = n_distinct.float()
+    return math.lgamma(Q + 1) - torch.lgamma(Q - m + 1)
 
 
 class CanonicalMask(nn.Module):
